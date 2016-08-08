@@ -40,6 +40,7 @@ while true
             c = Condition()
             SSH.on_channel_request(channel) do kind, packet
                 want_reply = read(packet, UInt8) != 0
+                @show kind
                 if kind == "pty-req"
                     TERM_var = SSH.read_string(packet)
                     termwidthchars = bswap(read(packet, UInt32))
@@ -48,15 +49,16 @@ while true
                     termheightpixs = bswap(read(packet, UInt32))
                     encoded_modes = SSH.read_string(packet)
                     notify(c)
+                elseif kind == "signal"
+                    SSH.disconnect(channel.session)
                 end
                 want_reply
-
             end
             open(channel)
             @async begin
                 wait(c)
                 slave, master = open_fake_pty()
-                p = spawn(`lua /Users/kfischer/Projects/termtris/termtris.lua`, slave, slave, slave)
+                p = spawn(`lua $(joinpath(ENV["HOME"],"termtris/termtris.lua")`, slave, slave, slave)
                 @async while true
                     write(channel, readavailable(master))
                 end

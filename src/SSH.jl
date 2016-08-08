@@ -82,7 +82,6 @@ module SSH
         skip(buf, padding_length)
         # mac is not encrypted
         mac = read(session.transport, session.mac_length)
-        @show payload
         # TODO: Verify MAC here
         session.recv_sequence_number += 1
         IOBuffer(payload)
@@ -332,9 +331,7 @@ module SSH
             data
         end
         session.decrypt! = function(data)
-            @show data
             MbedTLS.update!(decryptor, data, data)
-            @show data
             @assert MbedTLS.finish!(decryptor, data) == 0
             data
         end
@@ -407,7 +404,15 @@ module SSH
 
         # Set up crypto
         setup_crypt!(session, K, H)
-        @show session.decrypt!
+    end
+
+    function disconnect(session)
+        packet = PacketBuffer(SSH_MSG_DISCONNECT)
+        write(packet, bswap(UInt32(SSH_DISCONNECT_BY_APPLICATION)))
+        write_string(packet, "Disconnect requested")
+        write_string(packet, "en")
+        write(session, packet)
+        close(session.transport)
     end
 
     # Authentication ("ssh-userauth" service) (RFC 4252)
@@ -455,7 +460,6 @@ module SSH
                         n = read_mpint(blobbuf)
                         pubkey = MbedTLS.pubkey_from_vals!(MbedTLS.RSA(
                             MbedTLS.MBEDTLS_RSA_PKCS_V15, MD_SHA1), e, n)
-                        @show unsafe_load(pubkey.data)
                         # Generate the data over which to verify the signature
                         sigbuf = IOBuffer()
                         write_string(sigbuf, session.session_id)
@@ -622,6 +626,7 @@ module SSH
                 write(chan.input_buffer, data)
                 notify(chan.data_available)
             else
+                @show kind
                 packet = PacketBuffer(SSH_MSG_UNIMPLEMENTED)
                 write(packet, bswap(UInt32(session.recv_sequence_number)))
                 write(session, packet)
