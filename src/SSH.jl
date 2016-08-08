@@ -15,6 +15,7 @@ module SSH
         V_S::String
         I_C::Vector{UInt8}
         I_S::Vector{UInt8}
+        session_id::Vector{UInt8}
         Session(transport, is_client) = new(transport, is_client, 0, 0, 8, x->x, x->x, (data,seqno)->UInt8[])
     end
 
@@ -48,7 +49,7 @@ module SSH
     end
 
     block_size(session) = session.block_size
-    function read_packet(session)
+    function read_packet(session::Session)
         encrypted_begin = read(session.transport, block_size(session))
         buf = IOBuffer(session.decrypt!(encrypted_begin), true, true)
         packet_length = bswap(read(buf, UInt32))
@@ -61,6 +62,7 @@ module SSH
         skip(buf, padding_length)
         # mac is not encrypted
         mac = read(session.transport, session.mac_length)
+        @show payload
         # TODO: Verify MAC here
         IOBuffer(payload)
     end
@@ -92,22 +94,28 @@ module SSH
         # mac
     end
 
-    function require_packet(session, kind)
+    function require_packet(session::Session)
         local packet
         while true
             packet = read_packet(session)
-            got_kind = read(packet, UInt8)
-            if got_kind == SSH_MSG_IGNORE
+            if Base.peek(packet) == SSH_MSG_IGNORE
                 continue
             end
-            @assert got_kind == kind
             break
+        end
+        packet
+    end
+    function require_packet(session, kind)
+        packet = require_packet(session)
+        got_kind = read(packet, UInt8)
+        if got_kind != kind
+            error("Expected package $kind got $got_kind")
         end
         packet
     end
 
     const kex_algorithms = ["diffie-hellman-group14-sha1"]
-    const server_host_key_algorithms = ["ssh-dss","ssh-rsa"]
+    const server_host_key_algorithms = ["ssh-rsa"]
     const encryption_algorithms = ["aes128-ctr"]
     const mac_algorithms = ["hmac-sha1"]
     const compression_algorithms = ["zlib","none"]
@@ -244,37 +252,27 @@ module SSH
         update!(hasher, string)
     end
 
-    function client_dh_kex!(session, hasher=Hasher("SHA1"))
-        packet = PacketBuffer(SSH_MSG_KEXDH_INIT)
-        group = group14
-        # Perform Diffie-Hellman key exchange
-        x = rand(1:group.x_max)
-        e = powermod(group.g, x, group.p)
-        e_buf = IOBuffer()
-        write_mpint(e_buf, e)
-        e_data = takebuf_array(e_buf)
-        write(packet, e_data)
-        write(session, packet)
-        response = require_packet(session, SSH_MSG_KEXDH_REPLY)
-        K_S = read(response, bswap(read(response, UInt32)))
-        f_data = read_string(response)
-        f = import_bigint(f_data)
-        signature = read(response, bswap(read(response, UInt32)))
-        # Compute K
-        K = powermod(f, x, group.p)
-        K_buf = IOBuffer()
-        write_mpint(K_buf, K)
-        K_data = takebuf_array(K_buf)
-        # Compute H
+    function mpint_arr(mpint)
+        buf = IOBuffer()
+        write_mpint(buf, mpint)
+        takebuf_array(buf)
+    end
+
+    function compute_kex_hash(session, K_S, e_data, f_data, K)
+        hasher=Hasher("SHA1")
         update_string!(hasher, session.V_C)
         update_string!(hasher, session.V_S)
         update_string!(hasher, session.I_C)
         update_string!(hasher, session.I_S)
         update_string!(hasher, K_S)
-        update!(hasher, e_data)
+        update_string!(hasher, e_data)
         update_string!(hasher, f_data)
-        update!(hasher, K_data)
-        H = Nettle.digest!(hasher)
+        update!(hasher, mpint_arr(K))
+        Nettle.digest!(hasher)
+    end
+
+    function setup_crypt!(session, K, H)
+        K_data = mpint_arr(K)
         # Key derivation (rfc4253 - 7.2)
         # HASH(K || H || X || session_id)
         function derive_key(X)
@@ -282,7 +280,7 @@ module SSH
             update!(hasher, K_data)
             update!(hasher, H)
             update!(hasher, UInt8[X])
-            update!(hasher, H)
+            update!(hasher, session.session_id)
             Nettle.digest!(hasher)
         end
         cipher_type = MbedTLS.CipherInfo(MbedTLS.CIPHER_AES_128_CTR)
@@ -293,28 +291,35 @@ module SSH
         sc_enc = derive_key('D')[1:block_size]
         cs_int = derive_key('E')[1:20]
         sc_int = derive_key('F')[1:20]
-        # Validate signature here, I guess
+
+        # If client, Validate signature here, I guess
+
+        # Newkeys barrier
         write(session, PacketBuffer(SSH_MSG_NEWKEYS))
         require_packet(session, SSH_MSG_NEWKEYS)
+
+        # All further traffic will be encrypted
         encryptor = MbedTLS.Cipher(cipher_type)
-        MbedTLS.set_key!(encryptor, cs_enc, MbedTLS.ENCRYPT)
-        MbedTLS.set_iv!(encryptor, cs_IV)
+        MbedTLS.set_key!(encryptor, session.is_client ? cs_enc : sc_enc, MbedTLS.ENCRYPT)
+        MbedTLS.set_iv!(encryptor, session.is_client ? cs_IV : sc_IV)
         decryptor = MbedTLS.Cipher(cipher_type)
-        MbedTLS.set_key!(decryptor, sc_enc, MbedTLS.DECRYPT)
-        MbedTLS.set_iv!(decryptor, sc_IV)
+        MbedTLS.set_key!(decryptor, session.is_client ? sc_enc : cs_enc, MbedTLS.DECRYPT)
+        MbedTLS.set_iv!(decryptor, session.is_client ? sc_IV : cs_IV)
         session.encrypt! = function(data)
             MbedTLS.update!(encryptor, data, data)
             @assert MbedTLS.finish!(encryptor, data) == 0
             data
         end
         session.decrypt! = function(data)
+            @show data
             MbedTLS.update!(decryptor, data, data)
+            @show data
             @assert MbedTLS.finish!(decryptor, data) == 0
             data
         end
         session.hmac = function(data, seqno::UInt32)
             hmac = Array(UInt8, 20)
-            hmacx = MbedTLS.MD(MD_SHA1, cs_int)
+            hmacx = MbedTLS.MD(MD_SHA1, session.is_client ? cs_int : sc_int)
             write(hmacx, reinterpret(UInt8,[bswap(seqno)]))
             write(hmacx, data)
             MbedTLS.finish!(hmacx, hmac)
@@ -324,15 +329,140 @@ module SSH
         session.block_size = 16
     end
 
+    function client_dh_kex!(session)
+        packet = PacketBuffer(SSH_MSG_KEXDH_INIT)
+        group = group14
+        # Perform Diffie-Hellman key exchange
+        x = rand(1:group.x_max)
+        e = powermod(group.g, x, group.p)
+        e_data = mpint_arr(e)
+        write(packet, e_data)
+        write(session, packet)
+        response = require_packet(session, SSH_MSG_KEXDH_REPLY)
+        K_S = read(response, bswap(read(response, UInt32)))
+        f_data = read_string(response)
+        f = import_bigint(f_data)
+        signature = read(response, bswap(read(response, UInt32)))
+        # Compute K
+        K = powermod(f, x, group.p)
+        K_data = mpint_arr(K)
+        # Compute H
+        session.session_id = H = compute_kex_hash(session, K_S, e_data[5:end], f_data, K)
+        setup_crypt!(session, K, H)
+    end
+
+    function server_dh_kex!(session, hostkey_pub, hostkey_priv)
+        group = group14
+        # Get client's public value
+        packet = require_packet(session, SSH_MSG_KEXDH_INIT)
+        e_data = read_string(packet)
+        e = import_bigint(e_data)
+
+        # Prepare response
+        packet = PacketBuffer(SSH_MSG_KEXDH_REPLY)
+
+        # Get K_S from public key
+        pubkeydata = read(open(hostkey_pub))
+        K_S = base64decode(String(split(String(pubkeydata),' ')[2]))
+
+        write_string(packet, K_S)
+
+        # Compute y, f
+        y = rand(0:group.x_max)
+        f = powermod(group.g, y, group.p)
+        f_data = mpint_arr(f)
+
+        write(packet, f_data)
+
+        # Compute K and H
+        K = powermod(e, y, group.p)
+        session.session_id = H = compute_kex_hash(session, K_S, e_data, f_data[5:end], K)
+
+        # Sign H
+        write_string(packet, generate_signature(pubkeydata, hostkey_priv, H))
+
+        # Send back the packet
+        write(session, packet)
+
+        # Set up crypto
+        setup_crypt!(session, K, H)
+        @show session.decrypt!
+    end
+
     # Authentication ("ssh-userauth" service) (RFC 4252)
     function enter_userauth!(session)
         packet = PacketBuffer(SSH_MSG_SERVICE_REQUEST)
         write_string(packet, "ssh-userauth")
         write(session, packet)
-        read_string(require_packet(session, SSH_MSG_SERVICE_ACCEPT)) == "ssh-userauth"
+        @assert read_string(require_packet(session, SSH_MSG_SERVICE_ACCEPT)) == "ssh-userauth"
     end
 
-    function clientauth_list(session, username, servicename)
+    function wait_for_userauth(cb::Function, session, methods)
+        @assert String(read_string(require_packet(session, SSH_MSG_SERVICE_REQUEST))) == "ssh-userauth"
+        packet = PacketBuffer(SSH_MSG_SERVICE_ACCEPT)
+        write_string(packet, "ssh-userauth"); write(session, packet)
+
+        while true
+            packet = require_packet(session, SSH_MSG_USERAUTH_REQUEST)
+            username = String(read_string(packet))
+            servicename = String(read_string(packet))
+            methodname = String(read_string(packet))
+            @assert servicename == "ssh-connection"
+            if methodname == "none"
+            elseif methodname == "publickey"
+                has_sig = read(packet, UInt8) != 0
+                algorithm = read_string(packet)
+                blob = read_string(packet)
+                if cb(username, algorithm, blob)
+                    if !has_sig
+                        # Inform the client that this public key is acceptable
+                        packet = PacketBuffer(SSH_MSG_USERAUTH_PK_OK)
+                        write_string(packet, algorithm)
+                        write_string(packet, blob)
+                        write(session, packet)
+                        continue
+                    else
+                        signature = IOBuffer(read_string(packet))
+                        sigmethod = read_string(signature)
+                        @assert sigmethod == algorithm
+                        sigblob = read_string(signature)
+                        # Load the public key
+                        blobbuf = IOBuffer(blob)
+                        algname = read_string(blobbuf)
+                        @assert algname == algorithm
+                        e = read_mpint(blobbuf)
+                        n = read_mpint(blobbuf)
+                        pubkey = MbedTLS.pubkey_from_vals!(MbedTLS.RSA(
+                            MbedTLS.MBEDTLS_RSA_PKCS_V15, MD_SHA1), e, n)
+                        @show unsafe_load(pubkey.data)
+                        # Generate the data over which to verify the signature
+                        sigbuf = IOBuffer()
+                        write_string(sigbuf, session.session_id)
+                        write(sigbuf, UInt8(SSH_MSG_USERAUTH_REQUEST))
+                        write_string(sigbuf, username); write_string(sigbuf, servicename);
+                        write_string(sigbuf, methodname); write(sigbuf, UInt8(1))
+                        write_string(sigbuf, algorithm); write_string(sigbuf, blob)
+                        # Verify signature (throws on failure)
+                        MbedTLS.verify(pubkey, MD_SHA1,
+                            MbedTLS.digest(MD_SHA1, takebuf_array(sigbuf)),
+                            sigblob)
+                        # Indicate authentication success
+                        write(session, PacketBuffer(SSH_MSG_USERAUTH_SUCCESS))
+                        break
+                    end
+                    # Fall through to USERAUTH_FAILURE
+                end
+                # Fall through to USERAUTH_FAILURE
+            else
+                error("Unsupported Method")
+            end
+            packet = PacketBuffer(SSH_MSG_USERAUTH_FAILURE)
+            write_name_list(packet, methods); write(packet, UInt8(0))
+            write(session, packet)
+        end
+    end
+
+    function clientauth_list(session, username, servicename = "ssh-connection")
         packet = PacketBuffer(SSH_MSG_USERAUTH_REQUEST)
         write_string(packet, username)
         write_string(packet, servicename)
@@ -343,8 +473,55 @@ module SSH
         @show available_auth
     end
 
-    function clientauth_pubkey()
+    function generate_signature(pubkeydata, privkey, data)
+        pk = MbedTLS.parse_keyfile(privkey)
+        sig = Array(UInt8, 1024)
+        rng = Base.MersenneTwister()
+        len = MbedTLS.sign!(pk, MD_SHA1, MbedTLS.digest(MD_SHA1, data), sig, rng)
+        sig_buf = IOBuffer()
+        write_string(sig_buf, pubkeydata[1:7])
+        write_string(sig_buf, sig[1:len])
+        takebuf_array(sig_buf)
+    end
 
+    function clientauth_pubkey(session, username, pubkey, privkey, servicename = "ssh-connection")
+        packet = PacketBuffer(SSH_MSG_USERAUTH_REQUEST)
+
+        # Open publickey
+        pubkeydata = read(open(pubkey))
+
+        # Put together request
+        function write_request(io)
+            write_string(io, username)
+            write_string(io, servicename)
+            write_string(io, "publickey")
+            write(io, UInt8(1))
+
+            write_string(io, pubkeydata[1:7])
+            write_string(io, base64decode(String(split(String(pubkeydata),' ')[2])))
+        end
+        write_request(packet)
+
+        # Generate rsa signature
+        # Step 1: Assemble data to take the signature over
+        buf = IOBuffer()
+        write_string(buf, session.session_id)
+        write(buf, UInt8(SSH_MSG_USERAUTH_REQUEST))
+        write_request(buf)
+
+        # Step 2: Open private key and compute signature
+        write_string(packet, generate_signature(pubkeydata, privkey, takebuf_array(buf)))
+
+        write(session, packet)
+        packet = require_packet(session)
+        kind = read(packet, UInt8)
+        if kind == SSH_MSG_USERAUTH_SUCCESS
+            return true
+        elseif kind == SSH_MSG_USERAUTH_FAILURE
+            return false
+        else
+            error(kind)
+        end
     end
 
 end # module
