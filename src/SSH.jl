@@ -1,22 +1,42 @@
 module SSH
 
+    using DataStructures
+    using Nettle
     include("constants.jl")
+
+    const update! = Nettle.update!
 
     type Session
         transport::IO
         is_client::Bool
         mac_length::UInt8
         sequence_number::UInt32
+        recv_sequence_number::UInt32
         block_size::UInt16
         encrypt!::Any
         decrypt!::Any
         hmac::Any
+        channels::Vector{Any}
+        allocated_channels::DataStructures.IntSet
         V_C::String
         V_S::String
         I_C::Vector{UInt8}
         I_S::Vector{UInt8}
         session_id::Vector{UInt8}
-        Session(transport, is_client) = new(transport, is_client, 0, 0, 8, x->x, x->x, (data,seqno)->UInt8[])
+        Session(transport, is_client) = new(transport, is_client, 0, 0, 0, 8, x->x, x->x, (data,seqno)->UInt8[],
+            Vector{Any}(), DataStructures.IntSet())
+    end
+
+    type Channel
+        session::Session
+        isopen::Bool
+        input_buffer::IOBuffer
+        data_available::Condition
+        remote_number::UInt32
+        local_number::UInt32
+        window_size::UInt32
+        max_packet_size::UInt32
+        on_channel_request::Any
     end
 
     immutable PacketBuffer
@@ -64,6 +84,7 @@ module SSH
         mac = read(session.transport, session.mac_length)
         @show payload
         # TODO: Verify MAC here
+        session.recv_sequence_number += 1
         IOBuffer(payload)
     end
 
@@ -521,6 +542,90 @@ module SSH
             return false
         else
             error(kind)
+        end
+    end
+
+    # ssh-connection protocol
+    Base.isopen(chan::Channel) = chan.isopen
+    function Base.open(chan::Channel)
+        chan.isopen = true
+        packet = PacketBuffer(SSH_MSG_CHANNEL_OPEN_CONFIRMATION)
+        write(packet, bswap(chan.remote_number))
+        write(packet, bswap(chan.local_number))
+        write(packet, bswap(chan.window_size))
+        write(packet, bswap(chan.max_packet_size))
+        write(chan.session, packet)
+    end
+
+    function Base.write(chan::Channel, data)
+        packet = PacketBuffer(SSH_MSG_CHANNEL_DATA)
+        write(packet, bswap(chan.remote_number))
+        write_string(packet, data)
+        write(chan.session, packet)
+    end
+
+    function Base.readavailable(chan::Channel)
+        while nb_available(chan.input_buffer) == 0
+            wait(chan.data_available)
+        end
+        readavailable(chan.input_buffer)
+    end
+
+    on_channel_request(f, chan) = chan.on_channel_request = f
+
+    function allocate_channel_no(session)
+        idx = DataStructures.nextnot(session.allocated_channels, 0)[2]
+        (idx > length(session.channels)) && resize!(session.channels, idx)
+        idx
+    end
+
+    function perform_ssh_connection(new_chan_cb, session::Session)
+        while true
+            packet = require_packet(session)
+            kind = read(packet, UInt8)
+            if kind == SSH_MSG_CHANNEL_OPEN
+                chan_kind = read_string(packet)
+                remote_no = bswap(read(packet, UInt32))
+                initial_window = bswap(read(packet, UInt32))
+                max_packet_size = bswap(read(packet, UInt32))
+                local_no = allocate_channel_no(session)
+                chan = Channel(session, false, PipeBuffer(), Condition(),
+                    remote_no, local_no, initial_window, max_packet_size, nothing)
+                session.channels[local_no] = chan
+                new_chan_cb(String(chan_kind), chan)
+                if !isopen(chan)
+                    packet = PacketBuffer(SSH_MSG_CHANNEL_OPEN_FAILURE)
+                    write(packet, bswap(UInt32(remote_no)))
+                    write(packet, bswap(UInt32(SSH_OPEN_UNKNOWN_CHANNEL_TYPE)))
+                    write_string(packet, "Unknown channel type")
+                    write_string(packet, "en")
+                end
+            elseif kind == SSH_MSG_CHANNEL_REQUEST
+                channel_no = bswap(read(packet, UInt32))
+                chan = session.channels[channel_no]
+                req_type = String(read_string(packet))
+                if chan.on_channel_request !== nothing
+                    if chan.on_channel_request(req_type, packet)
+                        reply_packet = PacketBuffer(SSH_MSG_CHANNEL_SUCCESS)
+                        write(reply_packet, chan.remote_number)
+                        write(session, reply_packet)
+                    end
+                else
+                    reply_packet = PacketBuffer(SSH_MSG_CHANNEL_FAILURE)
+                    write(reply_packet, chan.remote_number)
+                    write(session, reply_packet)
+                end
+            elseif kind == SSH_MSG_CHANNEL_DATA
+                channel_no = bswap(read(packet, UInt32))
+                chan = session.channels[channel_no]
+                data = read_string(packet)
+                write(chan.input_buffer, data)
+                notify(chan.data_available)
+            else
+                packet = PacketBuffer(SSH_MSG_UNIMPLEMENTED)
+                write(packet, bswap(UInt32(session.recv_sequence_number)))
+                write(session, packet)
+            end
         end
     end
 
