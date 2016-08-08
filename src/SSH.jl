@@ -107,10 +107,13 @@ module SSH
             unencrypted_data = takebuf_array(buf)
             hmac = session.hmac(unencrypted_data, session.sequence_number)
             encrypted = session.encrypt!(unencrypted_data)
-            write(session.transport, encrypted)
-            write(session.transport, hmac)
+            sendbuf = IOBuffer()
+            write(sendbuf, encrypted); write(sendbuf, hmac)
+            # Make sure this is task-atomic
+            session.sequence_number += 1
+            write(session.transport, takebuf_array(sendbuf))
         end
-        session.sequence_number += 1
+
         # mac
     end
 
@@ -632,6 +635,129 @@ module SSH
                 write(session, packet)
             end
         end
+    end
+
+    # Encoded terminal modes
+    const NCCS = 32
+    immutable termios
+        c_iflag::Cuint
+        c_oflag::Cuint
+        c_cflag::Cuint
+        c_lflag::Cuint
+        c_line::UInt8
+        c_cc::NTuple{NCCS, UInt8}
+        c_uispeed::Cuint
+        c_ospeed::Cuint
+    end
+
+    op_char_map = Dict(
+         1 =>  0,  # VINTR
+         2 =>  1,  # VQUIT
+         3 =>  2,  # VERASE
+         4 =>  3,  # VKILL
+         5 =>  4,  # VEOF
+         6 => 11,  # VEOL
+         7 => 16,  # VEOL2
+         8 =>  8,  # VSTART
+         9 =>  9,  # VSTOP
+        10 => 10,  # VSUSP
+        11 => -1,  # VDUSP
+        12 => 12,  # VREPRINT
+        13 => 14,  # VWERASE
+        14 => 15,  # VLNEXT
+        15 => -1,  # VFLUSH
+        16 => -1,  # VSWTCH
+        17 => -1,  # VSTATUS
+        18 => -1,  # VDISCARD
+    )
+
+    iflag_map = Dict(
+        30 => 0o0000004, # IGNPAR
+        31 => 0o0000010, # PARMRK
+        32 => 0o0000020, # INPCK
+        33 => 0o0000040, # ISTRIP
+        34 => 0o0000100, # INLCR
+        35 => 0o0000200, # IGNCR
+        36 => 0o0000400, # ICRNL
+        37 => 0o0001000, # IUCLC
+        38 => 0o0002000, # IXON
+        39 => 0o0004000, # IXANY
+        40 => 0o0010000, # IXOFF
+        41 => 0o0020000, # IMAXBEL
+        42 => 0o0040000, # IUTF8
+    )
+
+    lflag_map = Dict(
+        50 => 0o0000001, # ISIG
+        51 => 0o0000002, # ICANON
+        52 => 0o0000004, # XCASE
+        53 => 0o0000010, # ECHO
+        54 => 0o0000020, # ECHOE
+        55 => 0o0000040, # ECHOK
+        56 => 0o0000100, # ECHONL
+        57 => 0o0000200, # NOFLSH
+        58 => 0o0000400, # TOSTOP
+        59 => 0o0100000, # IEXTEN
+        60 => 0o0001000, # ECHOCTL
+        61 => 0o0004000, # ECHOKE
+        62 => 0o0040000, # PENDIN
+    )
+
+    oflag_map = Dict(
+        70 => 0o0000001, # OPOST
+        71 => 0o0000002, # OLCUC
+        72 => 0o0000004, # ONLCR
+        73 => 0o0000010, # OCRNL
+        74 => 0o0000020, # ONOCR
+        75 => 0o0000040, # ONLRET
+    )
+
+    cflag_map = Dict(
+        90 => 0o0000040, # CS7
+        91 => 0o0000060, # CS8
+        92 => 0o0000400, # PARENB
+        93 => 0o0001000, # PARODD
+    )
+
+    function process_flags(flags, mask, operand)
+        if operand != 0
+            flags |= mask
+        else
+            flags &= ~mask
+        end
+        flags
+    end
+    function decode_modes(buf, old_termios)
+        iflags = UInt32(old_termios.c_iflag)
+        lflags = UInt32(old_termios.c_lflag)
+        oflags = UInt32(old_termios.c_oflag)
+        cflags = UInt32(old_termios.c_cflag)
+        c_cc = zeros(UInt8, NCCS)
+        for i = 1:NCCS
+            c_cc[i] = old_termios.c_cc[i]
+        end
+        while !eof(buf)
+            opcode = read(buf, UInt8)
+            if 1 <= opcode <= 159
+                operand = bswap(read(buf, UInt32))
+                if haskey(op_char_map, opcode)
+                    op_char_map[opcode] != -1 &&
+                        (c_cc[op_char_map[opcode]+1] = operand == 255 ?
+                         0 : operand)
+                elseif haskey(iflag_map, opcode)
+                    iflags |= process_flags(iflags, iflag_map[opcode], operand)
+                elseif haskey(lflag_map, opcode)
+                    lflags |= process_flags(lflags, lflag_map[opcode], operand)
+                elseif haskey(oflag_map, opcode)
+                    oflags |= process_flags(oflags, oflag_map[opcode], operand)
+                elseif haskey(cflag_map, opcode)
+                    cflags |= process_flags(cflags, cflag_map[opcode], operand)
+                end
+            else
+                break
+            end
+        end
+        return termios(iflags, oflags, cflags, lflags, 0, tuple(c_cc...), 0, 0)
     end
 
 end # module

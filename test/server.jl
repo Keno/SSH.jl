@@ -1,7 +1,8 @@
 reload("SSH")
 isdefined(:sock) && close(sock)
 gc()
-sock = listen(22)
+port = length(ARGS) >= 1 ? parse(Int, ARGS[1]) : 10000
+sock = listen(port)
 
 function open_fake_pty()
     const O_RDWR = Base.Filesystem.JL_O_RDWR
@@ -20,9 +21,8 @@ function open_fake_pty()
     # slave
     slave   = RawFD(fds)
     master = Base.TTY(RawFD(fdm); readable = true)
-    slave, master
+    slave, master, RawFD(fdm)
 end
-
 
 while true
     client = accept(sock)
@@ -38,6 +38,7 @@ while true
         SSH.perform_ssh_connection(session) do kind, channel
             if kind == "session"
                 c = Condition()
+                local encoded_termios
                 SSH.on_channel_request(channel) do kind, packet
                     want_reply = read(packet, UInt8) != 0
                     @show kind
@@ -48,6 +49,7 @@ while true
                         termwidthpixs = bswap(read(packet, UInt32))
                         termheightpixs = bswap(read(packet, UInt32))
                         encoded_modes = SSH.read_string(packet)
+                        encoded_termios = IOBuffer(encoded_modes)
                         notify(c)
                     elseif kind == "signal"
                         SSH.disconnect(channel.session)
@@ -55,16 +57,36 @@ while true
                     want_reply
                 end
                 open(channel)
+                TIOCSCTTY_str = """
+                    Libc.systemerror("ioctl",
+                    0 != ccall(:ioctl, Cint, (Cint, Cint, Int64), 0,
+                    (is_bsd() || is_apple()) ? 0x20007461 : is_linux() ? 0x540E :
+                    error("Fill in TIOCSCTTY for this OS here"), 0))
+                """
+                cmd = """
+                    $TIOCSCTTY_str
+                    try; run(`lua $(joinpath(ENV["HOME"],"termtris/termtris.lua"))`); end
+                """
                 @async begin
                     wait(c)
-                    slave, master = open_fake_pty()
-                    p = spawn(`lua $(joinpath(ENV["HOME"],"termtris/termtris.lua"))`, slave, slave, slave)
+                    slave, master, masterfd = open_fake_pty()
+                    new_termios = Ref{SSH.termios}()
+                    systemerror("tcgetattr",
+                        -1 == ccall(:tcgetattr, Cint, (Cint, Ptr{Void}), slave, new_termios))
+                    new_termios[] = SSH.decode_modes(encoded_termios, new_termios[])
+                    systemerror("tcsetattr",
+                        -1 == ccall(:tcsetattr, Cint, (Cint, Cint, Ptr{Void}), slave, 0, new_termios))
+                    p = spawn(detach(`$(Base.julia_cmd()) -e $cmd`), slave, slave, slave)
                     @async while true
                         write(channel, readavailable(master))
                     end
                     @async while true
-                        write(master, readavailable(channel))
+                        data = readavailable(channel)
+                        @show data
+                        write(master, data)
                     end
+                    wait(p)
+                    SSH.disconnect(session)
                 end
             end
         end
