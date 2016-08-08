@@ -638,85 +638,96 @@ module SSH
     end
 
     # Encoded terminal modes
-    const NCCS = 32
+    const NCCS = is_linux() ? 32 : 20
+    const tcflag_t = is_linux() ? Cuint : Culong
+    const speed_t = tcflag_t
     immutable termios
-        c_iflag::Cuint
-        c_oflag::Cuint
-        c_cflag::Cuint
-        c_lflag::Cuint
-        c_line::UInt8
+        c_iflag::tcflag_t
+        c_oflag::tcflag_t
+        c_cflag::tcflag_t
+        c_lflag::tcflag_t
+        @static if is_linux()
+            c_line::UInt8
+        end
         c_cc::NTuple{NCCS, UInt8}
-        c_uispeed::Cuint
-        c_ospeed::Cuint
+        c_uispeed::speed_t
+        c_ospeed::speed_t
     end
 
+    const maps_idx = is_linux() ? 1 : 2
+
     op_char_map = Dict(
-         1 =>  0,  # VINTR
-         2 =>  1,  # VQUIT
-         3 =>  2,  # VERASE
-         4 =>  3,  # VKILL
-         5 =>  4,  # VEOF
-         6 => 11,  # VEOL
-         7 => 16,  # VEOL2
-         8 =>  8,  # VSTART
-         9 =>  9,  # VSTOP
-        10 => 10,  # VSUSP
-        11 => -1,  # VDUSP
-        12 => 12,  # VREPRINT
-        13 => 14,  # VWERASE
-        14 => 15,  # VLNEXT
-        15 => -1,  # VFLUSH
-        16 => -1,  # VSWTCH
-        17 => -1,  # VSTATUS
-        18 => -1,  # VDISCARD
+    #  SSH => (linux, Apple/BSD)
+         1 => (  0,  8),  # VINTR
+         2 => (  1,  9),  # VQUIT
+         3 => (  2,  3),  # VERASE
+         4 => (  3,  5),  # VKILL
+         5 => (  4,  0),  # VEOF
+         6 => ( 11,  1),  # VEOL
+         7 => ( 16,  2),  # VEOL2
+         8 => (  8, 12),  # VSTART
+         9 => (  9, 13),  # VSTOP
+        10 => ( 10, 10),  # VSUSP
+        11 => ( -1, 11),  # VDUSP
+        12 => ( 12,  6),  # VREPRINT
+        13 => ( 14,  4),  # VWERASE
+        14 => ( 15, 14),  # VLNEXT
+        15 => ( -1, -1),  # VFLUSH
+        16 => ( -1, -1),  # VSWTCH
+        17 => ( -1, 18),  # VSTATUS
+        18 => ( -1, 15),  # VDISCARD
     )
 
     iflag_map = Dict(
-        30 => 0o0000004, # IGNPAR
-        31 => 0o0000010, # PARMRK
-        32 => 0o0000020, # INPCK
-        33 => 0o0000040, # ISTRIP
-        34 => 0o0000100, # INLCR
-        35 => 0o0000200, # IGNCR
-        36 => 0o0000400, # ICRNL
-        37 => 0o0001000, # IUCLC
-        38 => 0o0002000, # IXON
-        39 => 0o0004000, # IXANY
-        40 => 0o0010000, # IXOFF
-        41 => 0o0020000, # IMAXBEL
-        42 => 0o0040000, # IUTF8
+    #  SSH => ( Linux   , Apple/BSD )
+        30 => (0o0000004, 0x00000004), # IGNPAR
+        31 => (0o0000010, 0x00000008), # PARMRK
+        32 => (0o0000020, 0x00000010), # INPCK
+        33 => (0o0000040, 0x00000020), # ISTRIP
+        34 => (0o0000100, 0x00000040), # INLCR
+        35 => (0o0000200, 0x00000080), # IGNCR
+        36 => (0o0000400, 0x00000100), # ICRNL
+        37 => (0o0001000, 0x00000000), # IUCLC
+        38 => (0o0002000, 0x00000200), # IXON
+        39 => (0o0004000, 0x00000800), # IXANY
+        40 => (0o0010000, 0x00000400), # IXOFF
+        41 => (0o0020000, 0x00002000), # IMAXBEL
+        42 => (0o0040000, 0x00004000), # IUTF8
     )
 
     lflag_map = Dict(
-        50 => 0o0000001, # ISIG
-        51 => 0o0000002, # ICANON
-        52 => 0o0000004, # XCASE
-        53 => 0o0000010, # ECHO
-        54 => 0o0000020, # ECHOE
-        55 => 0o0000040, # ECHOK
-        56 => 0o0000100, # ECHONL
-        57 => 0o0000200, # NOFLSH
-        58 => 0o0000400, # TOSTOP
-        59 => 0o0100000, # IEXTEN
-        60 => 0o0001000, # ECHOCTL
-        61 => 0o0004000, # ECHOKE
-        62 => 0o0040000, # PENDIN
+    #  SSH => ( Linux   , Apple/BSD )
+        50 => (0o0000001, 0x00000080), # ISIG
+        51 => (0o0000002, 0x00000100), # ICANON
+        52 => (0o0000004, 0x00000000), # XCASE
+        53 => (0o0000010, 0x00000008), # ECHO
+        54 => (0o0000020, 0x00000002), # ECHOE
+        55 => (0o0000040, 0x00000004), # ECHOK
+        56 => (0o0000100, 0x00000010), # ECHONL
+        57 => (0o0000200, 0x80000000), # NOFLSH
+        58 => (0o0000400, 0x00400000), # TOSTOP
+        59 => (0o0100000, 0x00000400), # IEXTEN
+        60 => (0o0001000, 0x00000040), # ECHOCTL
+        61 => (0o0004000, 0x00000001), # ECHOKE
+        62 => (0o0040000, 0x20000000), # PENDIN
     )
 
     oflag_map = Dict(
-        70 => 0o0000001, # OPOST
-        71 => 0o0000002, # OLCUC
-        72 => 0o0000004, # ONLCR
-        73 => 0o0000010, # OCRNL
-        74 => 0o0000020, # ONOCR
-        75 => 0o0000040, # ONLRET
+    #  SSH => ( Linux   , Apple/BSD )
+        70 => (0o0000001, 0x00000001), # OPOST
+        71 => (0o0000002, 0x00000000), # OLCUC
+        72 => (0o0000004, 0x00000002), # ONLCR
+        73 => (0o0000010, 0x00000010), # OCRNL
+        74 => (0o0000020, 0x00000020), # ONOCR
+        75 => (0o0000040, 0x00000040), # ONLRET
     )
 
     cflag_map = Dict(
-        90 => 0o0000040, # CS7
-        91 => 0o0000060, # CS8
-        92 => 0o0000400, # PARENB
-        93 => 0o0001000, # PARODD
+    #  SSH => ( Linux   , Apple/BSD )
+        90 => (0o0000040, 0x00000200), # CS7
+        91 => (0o0000060, 0x00000300), # CS8
+        92 => (0o0000400, 0x00001000), # PARENB
+        93 => (0o0001000, 0x00002000), # PARODD
     )
 
     function process_flags(flags, mask, operand)
@@ -742,22 +753,23 @@ module SSH
                 operand = bswap(read(buf, UInt32))
                 if haskey(op_char_map, opcode)
                     op_char_map[opcode] != -1 &&
-                        (c_cc[op_char_map[opcode]+1] = operand == 255 ?
+                        (c_cc[op_char_map[opcode][maps_idx]+1] = operand == 255 ?
                          0 : operand)
                 elseif haskey(iflag_map, opcode)
-                    iflags |= process_flags(iflags, iflag_map[opcode], operand)
+                    iflags |= process_flags(iflags, iflag_map[opcode][maps_idx], operand)
                 elseif haskey(lflag_map, opcode)
-                    lflags |= process_flags(lflags, lflag_map[opcode], operand)
+                    lflags |= process_flags(lflags, lflag_map[opcode][maps_idx], operand)
                 elseif haskey(oflag_map, opcode)
-                    oflags |= process_flags(oflags, oflag_map[opcode], operand)
+                    oflags |= process_flags(oflags, oflag_map[opcode][maps_idx], operand)
                 elseif haskey(cflag_map, opcode)
-                    cflags |= process_flags(cflags, cflag_map[opcode], operand)
+                    cflags |= process_flags(cflags, cflag_map[opcode][maps_idx], operand)
                 end
             else
                 break
             end
         end
-        return termios(iflags, oflags, cflags, lflags, 0, tuple(c_cc...), 0, 0)
+        return termios(iflags, oflags, cflags, lflags,
+            (is_linux() ? (0,) : ())..., tuple(c_cc...), 0, 0)
     end
 
 end # module
