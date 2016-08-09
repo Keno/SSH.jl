@@ -1,10 +1,7 @@
 module SSH
 
     using DataStructures
-    using Nettle
     include("constants.jl")
-
-    const update! = Nettle.update!
 
     type Session
         transport::IO
@@ -268,7 +265,6 @@ module SSH
         0x15728E5A, 0x8AACAA68, 0xFFFFFFFF, 0xFFFFFFFF ]))
 
     using MbedTLS
-    using Nettle
 
     function update_string!(hasher, string)
         update!(hasher, reinterpret(UInt8,[bswap(UInt32(sizeof(string)))]))
@@ -282,16 +278,16 @@ module SSH
     end
 
     function compute_kex_hash(session, K_S, e_data, f_data, K)
-        hasher=Hasher("SHA1")
-        update_string!(hasher, session.V_C)
-        update_string!(hasher, session.V_S)
-        update_string!(hasher, session.I_C)
-        update_string!(hasher, session.I_S)
-        update_string!(hasher, K_S)
-        update_string!(hasher, e_data)
-        update_string!(hasher, f_data)
-        update!(hasher, mpint_arr(K))
-        Nettle.digest!(hasher)
+        hasher=MbedTLS.MD(MD_SHA1)
+        write_string(hasher, session.V_C)
+        write_string(hasher, session.V_S)
+        write_string(hasher, session.I_C)
+        write_string(hasher, session.I_S)
+        write_string(hasher, K_S)
+        write_string(hasher, e_data)
+        write_string(hasher, f_data)
+        write_mpint(hasher, K)
+        MbedTLS.finish!(hasher)
     end
 
     function setup_crypt!(session, K, H)
@@ -299,12 +295,12 @@ module SSH
         # Key derivation (rfc4253 - 7.2)
         # HASH(K || H || X || session_id)
         function derive_key(X)
-            hasher=Hasher("SHA1")
-            update!(hasher, K_data)
-            update!(hasher, H)
-            update!(hasher, UInt8[X])
-            update!(hasher, session.session_id)
-            Nettle.digest!(hasher)
+            hasher=MbedTLS.MD(MD_SHA1)
+            write(hasher, K_data)
+            write(hasher, H)
+            write(hasher, UInt8[X])
+            write(hasher, session.session_id)
+            MbedTLS.finish!(hasher)
         end
         cipher_type = MbedTLS.CipherInfo(MbedTLS.CIPHER_AES_128_CTR)
         block_size = 16
