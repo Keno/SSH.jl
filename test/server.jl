@@ -32,9 +32,9 @@ while true
         SSH.server_dh_kex!(session,
             joinpath(ENV["HOME"],".ssh","id_rsa.pub"),
             joinpath(ENV["HOME"],".ssh","id_rsa"))
-        SSH.wait_for_userauth(session, ["publickey"]) do username, algorithm, blob
+        SSH.wait_for_userauth(session, publickey = function (username, algorithm, blob)
             return true
-        end
+        end)
         SSH.perform_ssh_connection(session) do kind, channel
             if kind == "session"
                 c = Condition()

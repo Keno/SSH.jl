@@ -422,7 +422,7 @@ module SSH
         @assert read_string(require_packet(session, SSH_MSG_SERVICE_ACCEPT)) == "ssh-userauth"
     end
 
-    function wait_for_userauth(cb::Function, session, methods)
+    function wait_for_userauth(session; publickey = nothing, keyboard_interactive=nothing)
         @assert String(read_string(require_packet(session, SSH_MSG_SERVICE_REQUEST))) == "ssh-userauth"
         packet = PacketBuffer(SSH_MSG_SERVICE_ACCEPT)
         write_string(packet, "ssh-userauth"); write(session, packet)
@@ -438,7 +438,7 @@ module SSH
                 has_sig = read(packet, UInt8) != 0
                 algorithm = read_string(packet)
                 blob = read_string(packet)
-                if cb(username, algorithm, blob)
+                if publickey !== nothing && publickey(username, algorithm, blob)
                     if !has_sig
                         # Inform the client that this public key is acceptable
                         packet = PacketBuffer(SSH_MSG_USERAUTH_PK_OK)
@@ -477,13 +477,48 @@ module SSH
                     # Fall through to USERAUTH_FAILURE
                 end
                 # Fall through to USERAUTH_FAILURE
+            elseif methodname == "keyboard-interactive"
+                language_tag = read_string(packet)
+                submethods = read_string(packet)
+                if keyboard_interactive(session, submethods)
+                    write(session, PacketBuffer(SSH_MSG_USERAUTH_SUCCESS))
+                    break
+                end
+                # Fall through to USERAUTH_FAILURE
             else
                 error("Unsupported Method")
             end
             packet = PacketBuffer(SSH_MSG_USERAUTH_FAILURE)
-            write_name_list(packet, methods); write(packet, UInt8(0))
+            avilable_methods = []
+            publickey !== nothing && push!(avilable_methods, "publickey")
+            keyboard_interactive !== nothing && push!(avilable_methods, "keyboard-interactive")
+            write_name_list(packet, avilable_methods); write(packet, UInt8(0))
             write(session, packet)
         end
+    end
+
+    function keyboard_interactive_prompt(session, name, instruction, prompts = [], echo = true)
+        packet = PacketBuffer(SSH_MSG_USERAUTH_INFO_REQUEST)
+        write_string(packet, name)
+        write_string(packet, instruction)
+        write_string(packet, "")
+        nprompts = isa(prompts, Array) ? length(prompts) : 1
+        write(packet, bswap(Cint(nprompts)))
+        isa(prompts, Array) && !isa(echo, Array) && (echo = fill!(Vector{Bool}(length(prompts)),echo))
+        for (prompt, do_echo) in (isa(prompts, Array) ? zip(prompts,echo) : zip((prompts,),(echo,)))
+            write_string(packet, prompt)
+            write(packet, UInt8(do_echo))
+        end
+        write(session, packet)
+        reply = require_packet(session, SSH_MSG_USERAUTH_INFO_RESPONSE)
+        nreplys = bswap(read(reply, Cint))
+        if nreplys != nprompts
+            error("Reply number mismatch")
+        end
+        replys = map(1:nreplys) do _
+            read_string(reply)
+        end
+        return !isa(prompts, Array) ? replys[] : replys
     end
 
     function clientauth_list(session, username, servicename = "ssh-connection")

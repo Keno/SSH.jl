@@ -16,6 +16,9 @@ const SSH_MSG_USERAUTH_BANNER  = 53
 # Messages for Authentication method publickey
 const SSH_MSG_USERAUTH_PK_OK   = 60
 
+# Messages for Authentication method keyboard-interactive
+const SSH_MSG_USERAUTH_INFO_REQUEST     =  60
+const SSH_MSG_USERAUTH_INFO_RESPONSE    =  61
 
 # Messages for ssh-connection
 const SSH_MSG_GLOBAL_REQUEST            =  80
