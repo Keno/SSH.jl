@@ -422,7 +422,7 @@ module SSH
         @assert read_string(require_packet(session, SSH_MSG_SERVICE_ACCEPT)) == "ssh-userauth"
     end
 
-    function wait_for_userauth(session; publickey = nothing, keyboard_interactive=nothing)
+    function wait_for_userauth(session; publickey = nothing, keyboard_interactive=nothing, success_message = true)
         @assert String(read_string(require_packet(session, SSH_MSG_SERVICE_REQUEST))) == "ssh-userauth"
         packet = PacketBuffer(SSH_MSG_SERVICE_ACCEPT)
         write_string(packet, "ssh-userauth"); write(session, packet)
@@ -471,7 +471,7 @@ module SSH
                             MbedTLS.digest(MD_SHA1, takebuf_array(sigbuf)),
                             sigblob)
                         # Indicate authentication success
-                        write(session, PacketBuffer(SSH_MSG_USERAUTH_SUCCESS))
+                        success_message && write(session, PacketBuffer(SSH_MSG_USERAUTH_SUCCESS))
                         break
                     end
                     # Fall through to USERAUTH_FAILURE
@@ -481,21 +481,30 @@ module SSH
                 language_tag = read_string(packet)
                 submethods = read_string(packet)
                 if keyboard_interactive(session, submethods)
-                    write(session, PacketBuffer(SSH_MSG_USERAUTH_SUCCESS))
+                    success_message && write(session, PacketBuffer(SSH_MSG_USERAUTH_SUCCESS))
                     break
                 end
                 # Fall through to USERAUTH_FAILURE
             else
                 error("Unsupported Method")
             end
-            packet = PacketBuffer(SSH_MSG_USERAUTH_FAILURE)
-            avilable_methods = []
-            publickey !== nothing && push!(avilable_methods, "publickey")
-            keyboard_interactive !== nothing && push!(avilable_methods, "keyboard-interactive")
-            write_name_list(packet, avilable_methods); write(packet, UInt8(0))
-            write(session, packet)
+            userauth_failure(session, publickey=publickey,keyboard_interactive=keyboard_interactive)
         end
     end
+    function userauth_failure(session;publickey=nothing,keyboard_interactive=nothing,partial_success=false)
+        packet = PacketBuffer(SSH_MSG_USERAUTH_FAILURE)
+        avilable_methods = []
+        publickey !== nothing && push!(avilable_methods, "publickey")
+        keyboard_interactive !== nothing && push!(avilable_methods, "keyboard-interactive")
+        write_name_list(packet, avilable_methods); write(packet, UInt8(partial_success))
+        write(session, packet)
+    end
+    function userauth_partial_success(session;kwargs...)
+        userauth_failure(session;kwargs...,partial_success=true)
+        wait_for_userauth(session; kwargs..., success_message = false)
+        return true
+    end
+
 
     function keyboard_interactive_prompt(session, name, instruction, prompts = [], echo = true)
         packet = PacketBuffer(SSH_MSG_USERAUTH_INFO_REQUEST)
