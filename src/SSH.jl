@@ -55,7 +55,7 @@ module SSH
         ident = readuntil(transport, "\r\n")[1:end-2]
         # Some servers may announce dual-version support by sending SSH-1.99-. They
         # are not supported.
-        startswith(ident, "SSH-2.0-") || error("Invalid identification string")
+        startswith(ident, "SSH-2.0-") || error("Invalid identification string `$ident`")
         sess = Session(transport, client)
         if client
             sess.V_C = our_ident; sess.V_S = ident
@@ -486,7 +486,7 @@ module SSH
                 end
                 # Fall through to USERAUTH_FAILURE
             else
-                error("Unsupported Method")
+                error("Unsupported Method `$methodname`")
             end
             userauth_failure(session, publickey=publickey,keyboard_interactive=keyboard_interactive)
         end
@@ -792,7 +792,7 @@ module SSH
             if 1 <= opcode <= 159
                 operand = bswap(read(buf, UInt32))
                 if haskey(op_char_map, opcode)
-                    op_char_map[opcode] != -1 &&
+                    op_char_map[opcode][maps_idx] != -1 &&
                         (c_cc[op_char_map[opcode][maps_idx]+1] = operand == 255 ?
                          0 : operand)
                 elseif haskey(iflag_map, opcode)
