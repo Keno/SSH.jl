@@ -4,6 +4,7 @@ const SSH_MSG_UNIMPLEMENTED    = 3
 const SSH_MSG_DEBUG            = 4
 const SSH_MSG_SERVICE_REQUEST  = 5
 const SSH_MSG_SERVICE_ACCEPT   = 6
+const SSH_MSG_EXT_INFO         = 7
 const SSH_MSG_KEXINIT          = 20
 const SSH_MSG_NEWKEYS          = 21
 const SSH_MSG_KEXDH_INIT       = 30

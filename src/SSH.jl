@@ -1,8 +1,11 @@
 module SSH
 
+    const DEBUG_KEX = false
     using DataStructures
-    using Sockets
+    using Sockets, Base64
+    using Random
     include("constants.jl")
+    include("hexdump.jl")
 
     mutable struct Session
         transport::IO
@@ -23,6 +26,43 @@ module SSH
         session_id::Vector{UInt8}
         Session(transport, is_client) = new(transport, is_client, 0, 0, 0, 8, x->x, x->x, (data,seqno)->UInt8[],
             Vector{Any}(), DataStructures.IntSet())
+    end
+
+    struct AlgorithmChoices
+        kex_algorithm::String
+        host_key_algorithm::String
+        cs_crypt_algorithm::String
+        sc_crypt_algorithm::String
+        cs_mac_algorithm::String
+        sc_mac_algorithm::String
+        cs_comp_algorithm::String
+        sc_comp_algorithm::String
+        cs_lang_algorithm::String
+        sc_lang_algorithm::String
+        ext_info_support::Bool
+        AlgorithmChoices(;
+            kex_algorithm,
+            host_key_algorithm,
+            cs_crypt_algorithm,
+            sc_crypt_algorithm,
+            cs_mac_algorithm,
+            sc_mac_algorithm,
+            cs_comp_algorithm,
+            sc_comp_algorithm,
+            cs_lang_algorithm,
+            sc_lang_algorithm,
+            ext_info_support) = new(
+                kex_algorithm,
+                host_key_algorithm,
+                cs_crypt_algorithm,
+                sc_crypt_algorithm,
+                cs_mac_algorithm,
+                sc_mac_algorithm,
+                cs_comp_algorithm,
+                sc_comp_algorithm,
+                cs_lang_algorithm,
+                sc_lang_algorithm,
+                ext_info_support)
     end
 
     mutable struct Channel
@@ -53,7 +93,7 @@ module SSH
     function Sockets.connect(::Type{Session}, transport::IO; client = true)
         # Send the indentification string
         write(transport, our_ident, "\r\n")
-        ident = readuntil(transport, "\r\n")[1:end-2]
+        ident = readuntil(transport, "\r\n")
         # Some servers may announce dual-version support by sending SSH-1.99-. They
         # are not supported.
         startswith(ident, "SSH-2.0-") || error("Invalid identification string `$ident`")
@@ -135,8 +175,14 @@ module SSH
         packet
     end
 
-    const kex_algorithms = ["diffie-hellman-group14-sha1"]
-    const server_host_key_algorithms = ["ssh-rsa"]
+    const KEX_DH14_SHA1 = "diffie-hellman-group14-sha1"
+    const KEX_DH14_SHA256 = "diffie-hellman-group14-sha256"
+
+    const HK_RSA_SHA1 = "ssh-rsa"
+    const HK_RSA_SHA256 = "rsa-sha2-256"
+
+    const kex_algorithms = [KEX_DH14_SHA1, KEX_DH14_SHA256]
+    const server_host_key_algorithms = [HK_RSA_SHA1, HK_RSA_SHA256]
     const encryption_algorithms = ["aes128-ctr"]
     const mac_algorithms = ["hmac-sha1"]
     const compression_algorithms = ["zlib","none"]
@@ -150,7 +196,13 @@ module SSH
     function send_kexinit!(session)
         packet = PacketBuffer(SSH_MSG_KEXINIT)
         write(packet, rand(UInt8, 16))
-        write_name_list(packet, kex_algorithms)
+        local_kex_algorithms = copy(kex_algorithms)
+        if session.is_client
+            push!(local_kex_algorithms, "ext-info-c")
+        else
+            push!(local_kex_algorithms, "ext-info-s")
+        end
+        write_name_list(packet, local_kex_algorithms)
         write_name_list(packet, server_host_key_algorithms)
         write_name_list(packet, encryption_algorithms)
         write_name_list(packet, encryption_algorithms)
@@ -170,14 +222,18 @@ module SSH
         write(session, packet)
     end
 
-    function negotiate_algorithm(packet, client_list; allow_none = false)
-        list = read_name_list(packet)
-        idx = findfirst(alg->alg in list, client_list)
+    function negotiate_algorithm!(packet, our_list; allow_none = false)
+        remote_list = read_name_list(packet)
+        return _negotiate_algorithm(remote_list, our_list; allow_none)
+    end
+
+    function _negotiate_algorithm(remote_list, our_list; allow_none = false)
+        idx = findfirst(alg->alg in remote_list, our_list)
         if idx === nothing
             allow_none || error("Could not negotiate")
             return ""
         end
-        return client_list[idx]
+        return our_list[idx]
     end
 
     function read_name_list(packet)
@@ -194,27 +250,32 @@ module SSH
             session.I_C = take!(copy(packet))
         end
         skip(packet, 16) # Cookie
-        remote_kex_algorithms = read_name_list(packet)
-        remote_host_key_algorithms = read_name_list(packet)
-        kex_algorithm = findfirst(alg->alg in remote_kex_algorithms, kex_algorithms)
-        cs_crypt_algorithm = negotiate_algorithm(packet, encryption_algorithms)
-        sc_crypt_algorithm = negotiate_algorithm(packet, encryption_algorithms)
-        cs_mac_algorithm = negotiate_algorithm(packet, mac_algorithms)
-        sc_mac_algorithm = negotiate_algorithm(packet, mac_algorithms)
-        cs_comp_algorithm = negotiate_algorithm(packet, compression_algorithms)
-        sc_comp_algorithm = negotiate_algorithm(packet, compression_algorithms)
-        cs_lang_algorithm = negotiate_algorithm(packet, []; allow_none = true)
-        sc_lang_algorithm = negotiate_algorithm(packet, []; allow_none = true)
+        remote_kex_list = read_name_list(packet)
+        kex_algorithm = _negotiate_algorithm(remote_kex_list, kex_algorithms)
+        ext_info_support = (session.is_client ? "ext-info-s" : "ext-info-c") in remote_kex_list
+        host_key_algorithm = negotiate_algorithm!(packet, server_host_key_algorithms)
+        cs_crypt_algorithm = negotiate_algorithm!(packet, encryption_algorithms)
+        sc_crypt_algorithm = negotiate_algorithm!(packet, encryption_algorithms)
+        cs_mac_algorithm = negotiate_algorithm!(packet, mac_algorithms)
+        sc_mac_algorithm = negotiate_algorithm!(packet, mac_algorithms)
+        cs_comp_algorithm = negotiate_algorithm!(packet, compression_algorithms)
+        sc_comp_algorithm = negotiate_algorithm!(packet, compression_algorithms)
+        cs_lang_algorithm = negotiate_algorithm!(packet, []; allow_none = true)
+        sc_lang_algorithm = negotiate_algorithm!(packet, []; allow_none = true)
         first_kex_packet_follows = read(packet, UInt8)
         reserved = read(packet, UInt32)
         @assert first_kex_packet_follows == false && reserved == 0
+        AlgorithmChoices(; kex_algorithm, host_key_algorithm, cs_crypt_algorithm, sc_crypt_algorithm,
+            cs_mac_algorithm, sc_mac_algorithm, cs_comp_algorithm,
+            sc_comp_algorithm, cs_lang_algorithm, sc_lang_algorithm,
+            ext_info_support)
     end
 
     function write_mpint(packet, mpint::BigInt)
-        size = ndigits(mpint, 2)
+        size = ndigits(mpint; base=2)
         nbytes = div(size+8-1,8)
-        data = Array(UInt8, nbytes)
-        Base.GMP.MPZ.export!(data, mpint)
+        data = Vector{UInt8}(undef, nbytes)
+        Base.GMP.MPZ.export!(data, mpint; order=1, endian=1)
         # Need extra padding
         need_padding = false
         if size % 8 == 0
@@ -277,25 +338,34 @@ module SSH
         take!(buf)
     end
 
-    function compute_kex_hash(session, K_S, e_data, f_data, K)
-        hasher=MbedTLS.MD(MD_SHA1)
-        write_string(hasher, session.V_C)
-        write_string(hasher, session.V_S)
-        write_string(hasher, session.I_C)
-        write_string(hasher, session.I_S)
-        write_string(hasher, K_S)
-        write_string(hasher, e_data)
-        write_string(hasher, f_data)
-        write_mpint(hasher, K)
+    function write_kex_data(out, session, K_S, e_data, f_data, K)
+        write_string(out, session.V_C)
+        write_string(out, session.V_S)
+        write_string(out, session.I_C)
+        write_string(out, session.I_S)
+        write_string(out, K_S)
+        write_string(out, e_data)
+        write_string(out, f_data)
+        write_mpint(out, K)
+    end
+
+    function compute_kex_hash(session, K_S, e_data, f_data, K; md_alg=MD_SHA1)
+        hasher=MbedTLS.MD(md_alg)
+        write_kex_data(hasher, session, K_S, e_data, f_data, K)
+        if DEBUG_KEX
+            buf = IOBuffer()
+            write_kex_data(buf, session, K_S, e_data, f_data, K)
+            hexdump!(stdout, take!(buf))
+        end
         MbedTLS.finish!(hasher)
     end
 
-    function setup_crypt!(session, K, H)
+    function setup_crypt!(session, K, H; md_alg=MD_SHA1, hmac_alg=MD_SHA1)
         K_data = mpint_arr(K)
         # Key derivation (rfc4253 - 7.2)
         # HASH(K || H || X || session_id)
         function derive_key(X)
-            hasher=MbedTLS.MD(MD_SHA1)
+            hasher=MbedTLS.MD(md_alg)
             write(hasher, K_data)
             write(hasher, H)
             write(hasher, UInt8[X])
@@ -310,6 +380,15 @@ module SSH
         sc_enc = derive_key('D')[1:block_size]
         cs_int = derive_key('E')[1:20]
         sc_int = derive_key('F')[1:20]
+
+        if DEBUG_KEX
+            println("Key A:"); hexdump!(stdout, cs_IV)
+            println("Key B:"); hexdump!(stdout, sc_IV)
+            println("Key C:"); hexdump!(stdout, cs_enc)
+            println("Key D:"); hexdump!(stdout, sc_enc)
+            println("Key E:"); hexdump!(stdout, cs_int)
+            println("Key F:"); hexdump!(stdout, sc_int)
+        end
 
         # If client, Validate signature here, I guess
 
@@ -335,8 +414,8 @@ module SSH
             data
         end
         session.hmac = function(data, seqno::UInt32)
-            hmac = Array(UInt8, 20)
-            hmacx = MbedTLS.MD(MD_SHA1, session.is_client ? cs_int : sc_int)
+            hmac = Vector{UInt8}(undef, 20)
+            hmacx = MbedTLS.MD(hmac_alg, session.is_client ? cs_int : sc_int)
             write(hmacx, reinterpret(UInt8,[bswap(seqno)]))
             write(hmacx, data)
             MbedTLS.finish!(hmacx, hmac)
@@ -368,7 +447,7 @@ module SSH
         setup_crypt!(session, K, H)
     end
 
-    function server_dh_kex!(session, hostkey_pub, hostkey_priv)
+    function server_dh_kex!(session::Session, algorithms::AlgorithmChoices, hostkey_pub, hostkey_priv)
         group = group14
         # Get client's public value
         packet = require_packet(session, SSH_MSG_KEXDH_INIT)
@@ -380,7 +459,7 @@ module SSH
 
         # Get K_S from public key
         pubkeydata = read(open(hostkey_pub))
-        K_S = base64decode(String(split(String(pubkeydata),' ')[2]))
+        K_S = base64decode(String(split(String(copy(pubkeydata)),' ')[2]))
 
         write_string(packet, K_S)
 
@@ -391,18 +470,34 @@ module SSH
 
         write(packet, f_data)
 
+        # Determine MD algorithm from negotiated kex
+        kex_md_alg = algorithms.kex_algorithm == KEX_DH14_SHA1 ? MD_SHA1 :
+                     algorithms.kex_algorithm == KEX_DH14_SHA256 ? MD_SHA256 :
+                     error("Unknown MD for kex algorithm")
+
         # Compute K and H
         K = powermod(e, y, group.p)
-        session.session_id = H = compute_kex_hash(session, K_S, e_data, f_data[5:end], K)
+        session.session_id = H = compute_kex_hash(session, K_S, e_data, f_data[5:end], K; md_alg=kex_md_alg)
 
         # Sign H
-        write_string(packet, generate_signature(pubkeydata, hostkey_priv, H))
+        hk_md_alg = algorithms.host_key_algorithm == HK_RSA_SHA1 ? MD_SHA1 :
+                    algorithms.host_key_algorithm == HK_RSA_SHA256 ? MD_SHA256 :
+                    error("Unknown MD for hostkey algorithm")
+        write_string(packet, generate_signature(algorithms.host_key_algorithm, hostkey_priv, H; md_alg=hk_md_alg))
 
         # Send back the packet
         write(session, packet)
 
         # Set up crypto
-        setup_crypt!(session, K, H)
+        setup_crypt!(session, K, H; md_alg=kex_md_alg)
+    end
+
+    function send_server_sig_info!(session)
+        packet = PacketBuffer(SSH_MSG_EXT_INFO)
+        write(packet, bswap(UInt32(1)))
+        write_string(packet, "server-sig-algs")
+        write_name_list(packet, server_host_key_algorithms)
+        write(session, packet)
     end
 
     function disconnect(session)
@@ -454,7 +549,7 @@ module SSH
                         # Load the public key
                         blobbuf = IOBuffer(blob)
                         algname = read_string(blobbuf)
-                        @assert algname == algorithm
+                        @assert String(algname) == "ssh-rsa"
                         e = read_mpint(blobbuf)
                         n = read_mpint(blobbuf)
                         pubkey = MbedTLS.pubkey_from_vals!(MbedTLS.RSA(
@@ -466,9 +561,13 @@ module SSH
                         write_string(sigbuf, username); write_string(sigbuf, servicename);
                         write_string(sigbuf, methodname); write(sigbuf, UInt8(1))
                         write_string(sigbuf, algorithm); write_string(sigbuf, blob)
+                        algorithm = String(algorithm)
+                        sig_md_alg = algorithm == HK_RSA_SHA1 ? MD_SHA1 :
+                                     algorithm == HK_RSA_SHA256 ? MD_SHA256 :
+                                     error("Unknown signature algorithm")
                         # Verify signature (throws on failure)
-                        MbedTLS.verify(pubkey, MD_SHA1,
-                            MbedTLS.digest(MD_SHA1, take!(sigbuf)),
+                        MbedTLS.verify(pubkey, sig_md_alg,
+                            MbedTLS.digest(sig_md_alg, take!(sigbuf)),
                             sigblob)
                         # Indicate authentication success
                         success_message && write(session, PacketBuffer(SSH_MSG_USERAUTH_SUCCESS))
@@ -541,13 +640,13 @@ module SSH
         @show available_auth
     end
 
-    function generate_signature(pubkeydata, privkey, data)
+    function generate_signature(sig_algorithm, privkey, data; md_alg=MD_SHA1)
         pk = MbedTLS.parse_keyfile(privkey)
-        sig = Array(UInt8, 1024)
-        rng = Base.MersenneTwister()
-        len = MbedTLS.sign!(pk, MD_SHA1, MbedTLS.digest(MD_SHA1, data), sig, rng)
+        sig = Vector{UInt8}(undef, 1024)
+        rng = Random.MersenneTwister()
+        len = MbedTLS.sign!(pk, md_alg, MbedTLS.digest(md_alg, data), sig, rng)
         sig_buf = IOBuffer()
-        write_string(sig_buf, pubkeydata[1:7])
+        write_string(sig_buf, sig_algorithm)
         write_string(sig_buf, sig[1:len])
         take!(sig_buf)
     end
@@ -578,7 +677,7 @@ module SSH
         write_request(buf)
 
         # Step 2: Open private key and compute signature
-        write_string(packet, generate_signature(pubkeydata, privkey, take!(buf)))
+        write_string(packet, generate_signature("ssh-rsa", privkey, take!(buf)))
 
         write(session, packet)
         packet = require_packet(session)
@@ -612,7 +711,7 @@ module SSH
     end
 
     function Base.readavailable(chan::Channel)
-        while nb_available(chan.input_buffer) == 0
+        while bytesavailable(chan.input_buffer) == 0
             wait(chan.data_available)
         end
         readavailable(chan.input_buffer)
@@ -621,7 +720,7 @@ module SSH
     on_channel_request(f, chan) = chan.on_channel_request = f
 
     function allocate_channel_no(session)
-        idx = DataStructures.nextnot(session.allocated_channels, 0)[2]
+        idx = DataStructures.nextnot(session.allocated_channels, 1)[2]
         (idx > length(session.channels)) && resize!(session.channels, idx)
         idx
     end
@@ -809,7 +908,7 @@ module SSH
             end
         end
         return termios(iflags, oflags, cflags, lflags,
-            (is_linux() ? (0,) : ())..., tuple(c_cc...), 0, 0)
+            (Sys.islinux() ? (0,) : ())..., tuple(c_cc...), 0, 0)
     end
 
 end # module
