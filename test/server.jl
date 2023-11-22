@@ -16,83 +16,102 @@ function open_fake_pty()
     rc = ccall(:unlockpt, Cint, (Cint,), fdm)
     rc != 0 && error("unlockpt")
 
-    fds = ccall(:open, Cint, (Ptr{UInt8}, Cint),
+    fds = ccall(:open, Cint, (Ptr{UInt8}, Cint, UInt32...),
         ccall(:ptsname, Ptr{UInt8}, (Cint,), fdm), O_RDWR|O_NOCTTY)
 
     # slave
-    slave   = RawFD(fds)
-    master = Base.TTY(RawFD(fdm); readable = true)
-    slave, master, RawFD(fdm)
+    pts   = RawFD(fds)
+    ptm = Base.TTY(RawFD(fdm))
+    pts, ptm
 end
 
 while true
     client = accept(sock)
     @info "Accepted connection"
-    @async try
-        session = connect(SSH.Session, client; client = false)
-        SSH.negotiate_algorithms!(session)
-        SSH.server_dh_kex!(session,
-            joinpath(ENV["HOME"],".ssh","id_rsa.pub"),
-            joinpath(ENV["HOME"],".ssh","id_rsa"))
-        SSH.wait_for_userauth(session, publickey = function (username, algorithm, blob)
-            return true
-        end)
-        SSH.perform_ssh_connection(session) do kind, channel
-            if kind == "session"
-                c = Condition()
-                local encoded_termios
-                SSH.on_channel_request(channel) do kind, packet
-                    want_reply = read(packet, UInt8) != 0
-                    @show kind
-                    if kind == "pty-req"
-                        TERM_var = SSH.read_string(packet)
-                        termwidthchars = bswap(read(packet, UInt32))
-                        termheightchars = bswap(read(packet, UInt32))
-                        termwidthpixs = bswap(read(packet, UInt32))
-                        termheightpixs = bswap(read(packet, UInt32))
-                        encoded_modes = SSH.read_string(packet)
-                        encoded_termios = IOBuffer(encoded_modes)
-                        notify(c)
-                    elseif kind == "signal"
-                        SSH.disconnect(channel.session)
+    @isdefined(Revise) && Revise.revise()
+    invokelatest() do
+        @async try
+            session = connect(SSH.Session, client; client = false)
+            algorithms = SSH.negotiate_algorithms!(session)
+            SSH.server_dh_kex!(session, algorithms,
+                joinpath(dirname(@__FILE__), "test_only_hostkey.pub"),
+                joinpath(dirname(@__FILE__), "test_only_hostkey"))
+            if algorithms.ext_info_support
+                SSH.send_server_sig_info!(session)
+            end
+            SSH.wait_for_userauth(session, publickey = function (username, algorithm, blob)
+                return true
+            end)
+            SSH.perform_ssh_connection(session) do kind, channel
+                if kind == "session"
+                    c = Condition()
+                    local encoded_termios
+                    SSH.on_channel_request(channel) do kind, packet
+                        want_reply = read(packet, UInt8) != 0
+                        @show kind
+                        if kind == "pty-req"
+                            TERM_var = SSH.read_string(packet)
+                            termwidthchars = bswap(read(packet, UInt32))
+                            termheightchars = bswap(read(packet, UInt32))
+                            termwidthpixs = bswap(read(packet, UInt32))
+                            termheightpixs = bswap(read(packet, UInt32))
+                            encoded_modes = SSH.read_string(packet)
+                            encoded_termios = IOBuffer(encoded_modes)
+                        elseif kind == "signal"
+                            SSH.disconnect(channel.session)
+                        elseif kind == "shell"
+                            notify(c)
+                        end
+                        want_reply
                     end
-                    want_reply
-                end
-                open(channel)
-                TIOCSCTTY_str = """
-                    Libc.systemerror("ioctl",
-                    0 != ccall(:ioctl, Cint, (Cint, Cint, Int64), 0,
-                    (is_bsd() || is_apple()) ? 0x20007461 : is_linux() ? 0x540E :
-                    error("Fill in TIOCSCTTY for this OS here"), 0))
-                """
-                cmd = """
-                    $TIOCSCTTY_str
-                    try; run(`lua $(joinpath(ENV["HOME"],"termtris/termtris.lua"))`); end
-                """
-                @async begin
-                    wait(c)
-                    slave, master, masterfd = open_fake_pty()
-                    new_termios = Ref{SSH.termios}()
-                    systemerror("tcgetattr",
-                        -1 == ccall(:tcgetattr, Cint, (Cint, Ptr{Cvoid}), slave, new_termios))
-                    new_termios[] = SSH.decode_modes(encoded_termios, new_termios[])
-                    systemerror("tcsetattr",
-                        -1 == ccall(:tcsetattr, Cint, (Cint, Cint, Ptr{Cvoid}), slave, 0, new_termios))
-                    p = spawn(detach(`$(Base.julia_cmd()) -e $cmd`), slave, slave, slave)
-                    @async while true
-                        write(channel, readavailable(master))
+                    open(channel)
+                    TIOCSCTTY_str = """
+                        Libc.systemerror("ioctl",
+                        0 != ccall(:ioctl, Cint, (Cint, Cint, Int64), 0,
+                        Sys.isbsd() ? 0x20007461 : Sys.islinux() ? 0x540E :
+                        error("Fill in TIOCSCTTY for this OS here"), 0))
+                    """
+                    cmd = """
+                        $TIOCSCTTY_str
+                        while true
+                            print("Req? ")
+                            println("Rep: ", readline(stdin))
+                        end
+                    """
+                    @async try
+                        wait(c)
+                        pts, ptm = open_fake_pty()
+                        new_termios = Ref{SSH.termios}()
+                        systemerror("tcgetattr",
+                            -1 == ccall(:tcgetattr, Cint, (Cint, Ptr{Cvoid}), pts, new_termios))
+                        new_termios[] = SSH.decode_modes(encoded_termios, new_termios[])
+                        systemerror("tcsetattr",
+                            -1 == ccall(:tcsetattr, Cint, (Cint, Cint, Ptr{Cvoid}), pts, 0, new_termios))
+                        p = run(detach(`$(Base.julia_cmd()) -e $cmd`), pts, pts, pts; wait=false)
+                        @async try
+                            while true
+                                write(channel, readavailable(ptm))
+                            end
+                        catch err
+                            Base.display_error(err, catch_backtrace())
+                        end
+                        @async try
+                            while true
+                                data = readavailable(channel)
+                                write(ptm, data)
+                            end
+                        catch err
+                            Base.display_error(err, catch_backtrace())
+                        end
+                        wait(p)
+                        SSH.disconnect(session)
+                    catch err
+                        Base.display_error(err, catch_backtrace())
                     end
-                    @async while true
-                        data = readavailable(channel)
-                        @show data
-                        write(master, data)
-                    end
-                    wait(p)
-                    SSH.disconnect(session)
                 end
             end
+        catch err
+            Base.display_error(err, catch_backtrace())
         end
-    catch err
-        Base.showerror(stderr, err, catch_backtrace())
     end
 end
