@@ -32,7 +32,6 @@ function run_server()
         session = connect(SSH.Session, client; client = false)
         algorithms = SSH.negotiate_algorithms!(session)
         SSH.server_dh_kex!(session, algorithms,
-            joinpath(dirname(@__FILE__), "test_only_hostkey.pub"),
             joinpath(dirname(@__FILE__), "test_only_hostkey"))
         if algorithms.ext_info_support
             SSH.send_server_sig_info!(session)

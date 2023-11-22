@@ -4,6 +4,8 @@ module SSH
     using DataStructures
     using Sockets, Base64
     using Random
+    using MbedTLS
+
     include("constants.jl")
     include("hexdump.jl")
 
@@ -65,7 +67,7 @@ module SSH
                 ext_info_support)
     end
 
-    mutable struct Channel
+    mutable struct Channel <: IO
         session::Session
         isopen::Bool
         input_buffer::IOBuffer
@@ -289,6 +291,18 @@ module SSH
         write(packet, data)
     end
 
+    function write_mpint(packet, mpint::MbedTLS.MPI)
+        sz = MbedTLS.mpi_size(mpint)
+        need_padding = false
+        if sz % 8 == 0
+            sz += 1
+            need_padding = true
+        end
+        write_string_length(packet, sz)
+        need_padding && write(packet, UInt8(0))
+        MbedTLS.mpi_export!(packet, mpint)
+    end
+
     function import_bigint(data::Vector)
         b = BigInt()
         ccall((:__gmpz_import,Base.GMP.MPZ.libgmp), Ptr{Cvoid},
@@ -298,7 +312,8 @@ module SSH
     end
 
     read_string(packet) = read(packet, bswap(read(packet, UInt32)))
-    write_string(packet, data) = (write(packet, bswap(UInt32(sizeof(data)))); write(packet, data))
+    write_string_length(packet, len::Integer) = write(packet, bswap(UInt32(len)))
+    write_string(packet, data) = (write_string_length(packet, sizeof(data)); write(packet, data))
     function read_mpint(packet)
         data = read_string(packet)
         import_bigint(data)
@@ -324,8 +339,6 @@ module SSH
         0xE39E772C, 0x180E8603, 0x9B2783A2, 0xEC07A28F, 0xB5C55DF0, 0x6F4C52C9,
         0xDE2BCBF6, 0x95581718, 0x3995497C, 0xEA956AE5, 0x15D22618, 0x98FA0510,
         0x15728E5A, 0x8AACAA68, 0xFFFFFFFF, 0xFFFFFFFF ]))
-
-    using MbedTLS
 
     function update_string!(hasher, string)
         update!(hasher, reinterpret(UInt8,[bswap(UInt32(sizeof(string)))]))
@@ -447,8 +460,24 @@ module SSH
         setup_crypt!(session, K, H)
     end
 
-    function server_dh_kex!(session::Session, algorithms::AlgorithmChoices, hostkey_pub, hostkey_priv)
+    function derive_pubkey(pk, algname)
+        rsa = MbedTLS.RSA(pk)
+        MbedTLS.complete!(rsa)
+        (; N, E) = rsa
+        KSbuf = IOBuffer()
+        write_string(KSbuf, algname)
+        write_mpint(KSbuf, E)
+        write_mpint(KSbuf, N)
+        K_S = take!(KSbuf)
+        return K_S
+    end
+
+    function server_dh_kex!(session::Session, algorithms::AlgorithmChoices, hostkey_priv)
         group = group14
+
+        # Parse private key
+        pk = MbedTLS.parse_keyfile(hostkey_priv)
+
         # Get client's public value
         packet = require_packet(session, SSH_MSG_KEXDH_INIT)
         e_data = read_string(packet)
@@ -457,10 +486,8 @@ module SSH
         # Prepare response
         packet = PacketBuffer(SSH_MSG_KEXDH_REPLY)
 
-        # Get K_S from public key
-        pubkeydata = read(open(hostkey_pub))
-        K_S = base64decode(String(split(String(copy(pubkeydata)),' ')[2]))
-
+        # Derive K_S from private key data
+        K_S = derive_pubkey(pk, "ssh-rsa")
         write_string(packet, K_S)
 
         # Compute y, f
@@ -483,7 +510,7 @@ module SSH
         hk_md_alg = algorithms.host_key_algorithm == HK_RSA_SHA1 ? MD_SHA1 :
                     algorithms.host_key_algorithm == HK_RSA_SHA256 ? MD_SHA256 :
                     error("Unknown MD for hostkey algorithm")
-        write_string(packet, generate_signature(algorithms.host_key_algorithm, hostkey_priv, H; md_alg=hk_md_alg))
+        write_string(packet, generate_signature(algorithms.host_key_algorithm, pk, H; md_alg=hk_md_alg))
 
         # Send back the packet
         write(session, packet)
@@ -521,6 +548,7 @@ module SSH
         @assert String(read_string(require_packet(session, SSH_MSG_SERVICE_REQUEST))) == "ssh-userauth"
         packet = PacketBuffer(SSH_MSG_SERVICE_ACCEPT)
         write_string(packet, "ssh-userauth"); write(session, packet)
+        local username
 
         while true
             packet = require_packet(session, SSH_MSG_USERAUTH_REQUEST)
@@ -593,6 +621,8 @@ module SSH
             end
             userauth_failure(session, publickey=publickey,keyboard_interactive=keyboard_interactive)
         end
+
+        return username
     end
     function userauth_failure(session;publickey=nothing,keyboard_interactive=nothing,partial_success=false)
         packet = PacketBuffer(SSH_MSG_USERAUTH_FAILURE)
@@ -644,8 +674,7 @@ module SSH
         @show available_auth
     end
 
-    function generate_signature(sig_algorithm, privkey, data; md_alg=MD_SHA1)
-        pk = MbedTLS.parse_keyfile(privkey)
+    function generate_signature(sig_algorithm, pk, data; md_alg=MD_SHA1)
         sig = Vector{UInt8}(undef, 1024)
         rng = Random.MersenneTwister()
         len = MbedTLS.sign!(pk, md_alg, MbedTLS.digest(md_alg, data), sig, rng)
@@ -681,7 +710,8 @@ module SSH
         write_request(buf)
 
         # Step 2: Open private key and compute signature
-        write_string(packet, generate_signature("ssh-rsa", privkey, take!(buf)))
+        pk = MbedTLS.parse_keyfile(privkey)
+        write_string(packet, generate_signature("ssh-rsa", pk, take!(buf)))
 
         write(session, packet)
         packet = require_packet(session)
@@ -707,7 +737,15 @@ module SSH
         write(chan.session, packet)
     end
 
-    function Base.write(chan::Channel, data)
+    function Base.write(chan::Channel, data::Vector{UInt8})
+        _write(chan, data)
+    end
+
+    function Base.write(chan::Channel, data::String)
+        _write(chan, data)
+    end
+
+    function _write(chan::Channel, data)
         packet = PacketBuffer(SSH_MSG_CHANNEL_DATA)
         write(packet, bswap(chan.remote_number))
         write_string(packet, data)
@@ -730,11 +768,26 @@ module SSH
         write(chan.session, packet)
     end
 
+    Base.bytesavailable(chan::Channel) = bytesavailable(chan.input_buffer)
+
     function Base.readavailable(chan::Channel)
-        while bytesavailable(chan.input_buffer) == 0
+        while bytesavailable(chan) == 0
             wait(chan.data_available)
         end
         readavailable(chan.input_buffer)
+    end
+
+    function Base.read(chan::Channel, ::Type{UInt8})
+        while bytesavailable(chan) == 0
+            wait(chan.data_available)
+        end
+        read(chan.input_buffer, UInt8)
+    end
+
+    function Base.check_open(chan::Channel)
+        if !isopen(chan)
+            throw(IOError("Channel is closed", 0))
+        end
     end
 
     on_channel_request(f, chan) = chan.on_channel_request = f
@@ -806,6 +859,32 @@ module SSH
             end
         end
     end
+
+    function accept_session(sock, hostkey)
+        client = accept(sock)
+        session = connect(SSH.Session, client; client = false)
+        algorithms = SSH.negotiate_algorithms!(session)
+        SSH.server_dh_kex!(session, algorithms, hostkey)
+        if algorithms.ext_info_support
+            SSH.send_server_sig_info!(session)
+        end
+        return session
+    end
+
+    struct CheckAuthorizedKeys
+        authorized_keys::Union{String, Vector{String}}
+    end
+
+    function (this::CheckAuthorizedKeys)(_, _, blob)
+        for line in (isa(this.authorized_keys, String) ? eachline(this.authorized_keys) : this.authorized_keys)
+            (_, ok_blob) = split(line, ' ')
+            if ok_blob == base64encode(blob)
+                return true
+            end
+        end
+        return false
+    end
+
 
     # Encoded terminal modes
     const NCCS = Sys.islinux() ? 32 : 20
