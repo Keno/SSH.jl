@@ -517,7 +517,7 @@ module SSH
         @assert read_string(require_packet(session, SSH_MSG_SERVICE_ACCEPT)) == "ssh-userauth"
     end
 
-    function wait_for_userauth(session; publickey = nothing, keyboard_interactive=nothing, success_message = true)
+    function wait_for_userauth(session; allow_none=false, publickey = nothing, keyboard_interactive=nothing, success_message = true)
         @assert String(read_string(require_packet(session, SSH_MSG_SERVICE_REQUEST))) == "ssh-userauth"
         packet = PacketBuffer(SSH_MSG_SERVICE_ACCEPT)
         write_string(packet, "ssh-userauth"); write(session, packet)
@@ -529,6 +529,10 @@ module SSH
             methodname = String(read_string(packet))
             @assert servicename == "ssh-connection"
             if methodname == "none"
+                if allow_none
+                    success_message && write(session, PacketBuffer(SSH_MSG_USERAUTH_SUCCESS))
+                    break
+                end
             elseif methodname == "publickey"
                 has_sig = read(packet, UInt8) != 0
                 algorithm = read_string(packet)
@@ -710,6 +714,22 @@ module SSH
         write(chan.session, packet)
     end
 
+    function Base.close(chan::Channel)
+        chan.isopen = false
+        packet = PacketBuffer(SSH_MSG_CHANNEL_CLOSE)
+        write(packet, bswap(chan.remote_number))
+        write(chan.session, packet)
+    end
+
+    function send_exit_status!(chan::Channel, status::UInt32)
+        packet = PacketBuffer(SSH_MSG_CHANNEL_REQUEST)
+        write(packet, bswap(chan.remote_number))
+        write_string(packet, "exit-status")
+        write(packet, 0x00)
+        write(packet, bswap(status))
+        write(chan.session, packet)
+    end
+
     function Base.readavailable(chan::Channel)
         while bytesavailable(chan.input_buffer) == 0
             wait(chan.data_available)
@@ -738,6 +758,7 @@ module SSH
                 chan = Channel(session, false, PipeBuffer(), Condition(),
                     remote_no, local_no, initial_window, max_packet_size, nothing)
                 session.channels[local_no] = chan
+                push!(session.allocated_channels, local_no)
                 new_chan_cb(String(chan_kind), chan)
                 if !isopen(chan)
                     packet = PacketBuffer(SSH_MSG_CHANNEL_OPEN_FAILURE)
@@ -767,8 +788,18 @@ module SSH
                 data = read_string(packet)
                 write(chan.input_buffer, data)
                 notify(chan.data_available)
+            elseif kind == SSH_MSG_CHANNEL_CLOSE
+                channel_no = bswap(read(packet, UInt32))
+                chan = session.channels[channel_no]
+                if chan.isopen
+                    close(chan)
+                end
+                session.channels[channel_no] = nothing
+                pop!(session.allocated_channels, channel_no)
+            elseif kind == SSH_MSG_DISCONNECT
+                close(session.transport)
+                return true
             else
-                @show kind
                 packet = PacketBuffer(SSH_MSG_UNIMPLEMENTED)
                 write(packet, bswap(UInt32(session.recv_sequence_number)))
                 write(session, packet)

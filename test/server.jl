@@ -61,6 +61,10 @@ while true
                             SSH.disconnect(channel.session)
                         elseif kind == "shell"
                             notify(c)
+                        elseif kind == "exec"
+                            exec_cmd = SSH.read_string(packet)
+                            @show String(exec_cmd)
+                            notify(c)
                         end
                         want_reply
                     end
@@ -81,12 +85,14 @@ while true
                     @async try
                         wait(c)
                         pts, ptm = open_fake_pty()
-                        new_termios = Ref{SSH.termios}()
-                        systemerror("tcgetattr",
-                            -1 == ccall(:tcgetattr, Cint, (Cint, Ptr{Cvoid}), pts, new_termios))
-                        new_termios[] = SSH.decode_modes(encoded_termios, new_termios[])
-                        systemerror("tcsetattr",
-                            -1 == ccall(:tcsetattr, Cint, (Cint, Cint, Ptr{Cvoid}), pts, 0, new_termios))
+                        if @isdefined(encoded_termios)
+                            new_termios = Ref{SSH.termios}()
+                            systemerror("tcgetattr",
+                                -1 == ccall(:tcgetattr, Cint, (Cint, Ptr{Cvoid}), pts, new_termios))
+                            new_termios[] = SSH.decode_modes(encoded_termios, new_termios[])
+                            systemerror("tcsetattr",
+                                -1 == ccall(:tcsetattr, Cint, (Cint, Cint, Ptr{Cvoid}), pts, 0, new_termios))
+                        end
                         p = run(detach(`$(Base.julia_cmd()) -e $cmd`), pts, pts, pts; wait=false)
                         @async try
                             while true
