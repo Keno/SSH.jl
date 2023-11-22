@@ -1,9 +1,10 @@
 module SSH
 
     using DataStructures
+    using Sockets
     include("constants.jl")
 
-    type Session
+    mutable struct Session
         transport::IO
         is_client::Bool
         mac_length::UInt8
@@ -24,7 +25,7 @@ module SSH
             Vector{Any}(), DataStructures.IntSet())
     end
 
-    type Channel
+    mutable struct Channel
         session::Session
         isopen::Bool
         input_buffer::IOBuffer
@@ -36,7 +37,7 @@ module SSH
         on_channel_request::Any
     end
 
-    immutable PacketBuffer
+    struct PacketBuffer
         buf::IOBuffer
         function PacketBuffer(packet_type)
             buf = IOBuffer()
@@ -49,7 +50,7 @@ module SSH
     Base.write(buf::PacketBuffer, args...) = write(buf.buf, args...)
 
     our_ident = "SSH-2.0-SSH.jlv0.1 Do not use in production systems"
-    function Base.connect(::Type{Session}, transport::IO; client = true)
+    function Sockets.connect(::Type{Session}, transport::IO; client = true)
         # Send the indentification string
         write(transport, our_ident, "\r\n")
         ident = readuntil(transport, "\r\n")[1:end-2]
@@ -68,7 +69,7 @@ module SSH
     block_size(session) = session.block_size
     function read_packet(session::Session)
         encrypted_begin = read(session.transport, block_size(session))
-        buf = IOBuffer(session.decrypt!(encrypted_begin), true, true)
+        buf = IOBuffer(session.decrypt!(encrypted_begin); read=true, write=true)
         packet_length = bswap(read(buf, UInt32))
         padding_length = read(buf, UInt8)
         remaining_enc_length = (packet_length + sizeof(UInt32)) - block_size(session)
@@ -85,7 +86,7 @@ module SSH
     end
 
     function Base.write(session::Session, buf::PacketBuffer)
-        payload = takebuf_array(copy(buf.buf))
+        payload = take!(copy(buf.buf))
         block_size = session.block_size
         packet_length = sizeof(payload) + sizeof(UInt8)
         padding_size = mod(block_size-mod(packet_length+sizeof(UInt32), block_size), block_size)
@@ -101,14 +102,14 @@ module SSH
             write(buf, UInt8(padding_size))
             write(buf, payload)
             write(buf, rand(UInt8, padding_size))
-            unencrypted_data = takebuf_array(buf)
+            unencrypted_data = take!(buf)
             hmac = session.hmac(unencrypted_data, session.sequence_number)
             encrypted = session.encrypt!(unencrypted_data)
             sendbuf = IOBuffer()
             write(sendbuf, encrypted); write(sendbuf, hmac)
             # Make sure this is task-atomic
             session.sequence_number += 1
-            write(session.transport, takebuf_array(sendbuf))
+            write(session.transport, take!(sendbuf))
         end
 
         # mac
@@ -162,9 +163,9 @@ module SSH
         write(packet, UInt8(0)) # first_kex_packet_follows
         write(packet, UInt32(0))
         if session.is_client
-            session.I_C = takebuf_array(copy(packet))
+            session.I_C = take!(copy(packet))
         else
-            session.I_S = takebuf_array(copy(packet))
+            session.I_S = take!(copy(packet))
         end
         write(session, packet)
     end
@@ -172,8 +173,11 @@ module SSH
     function negotiate_algorithm(packet, client_list; allow_none = false)
         list = read_name_list(packet)
         idx = findfirst(alg->alg in list, client_list)
-        !allow_none && idx == 0 && error("Could not negotiate")
-        idx == 0 ? "" : client_list[idx]
+        if idx === nothing
+            allow_none || error("Could not negotiate")
+            return ""
+        end
+        return client_list[idx]
     end
 
     function read_name_list(packet)
@@ -185,9 +189,9 @@ module SSH
         send_kexinit!(session)
         packet = require_packet(session, SSH_MSG_KEXINIT)
         if session.is_client
-            session.I_S = takebuf_array(copy(packet))
+            session.I_S = take!(copy(packet))
         else
-            session.I_C = takebuf_array(copy(packet))
+            session.I_C = take!(copy(packet))
         end
         skip(packet, 16) # Cookie
         remote_kex_algorithms = read_name_list(packet)
@@ -210,11 +214,7 @@ module SSH
         size = ndigits(mpint, 2)
         nbytes = div(size+8-1,8)
         data = Array(UInt8, nbytes)
-        count = Ref{Csize_t}(0)
-        ccall((:__gmpz_export,:libgmp), Ptr{Void},
-                (Ptr{Void}, Ptr{Csize_t}, Cint, Csize_t, Cint, Csize_t, Ptr{BigInt}),
-                data, count, 1, 1, 1, 0, &mpint)
-        @assert count[] == nbytes
+        Base.GMP.MPZ.export!(data, mpint)
         # Need extra padding
         need_padding = false
         if size % 8 == 0
@@ -228,11 +228,11 @@ module SSH
         write(packet, data)
     end
 
-    function import_bigint{T}(data::Vector{T})
+    function import_bigint(data::Vector)
         b = BigInt()
-        ccall((:__gmpz_import,:libgmp), Ptr{Void},
-            (Ptr{BigInt}, Csize_t, Cint, Csize_t, Cint, Csize_t, Ptr{Void}),
-            &b, length(data), 1, sizeof(data[]), 1, 0, data)
+        ccall((:__gmpz_import,Base.GMP.MPZ.libgmp), Ptr{Cvoid},
+            (Base.GMP.MPZ.mpz_t, Csize_t, Cint, Csize_t, Cint, Csize_t, Ptr{Cvoid}),
+            b, length(data), 1, sizeof(eltype(data)), 1, 0, data)
         b
     end
 
@@ -243,7 +243,7 @@ module SSH
         import_bigint(data)
     end
 
-    immutable DHGroup
+    struct DHGroup
         g::BigInt
         p::BigInt
         x_max::BigInt
@@ -274,7 +274,7 @@ module SSH
     function mpint_arr(mpint)
         buf = IOBuffer()
         write_mpint(buf, mpint)
-        takebuf_array(buf)
+        take!(buf)
     end
 
     function compute_kex_hash(session, K_S, e_data, f_data, K)
@@ -468,7 +468,7 @@ module SSH
                         write_string(sigbuf, algorithm); write_string(sigbuf, blob)
                         # Verify signature (throws on failure)
                         MbedTLS.verify(pubkey, MD_SHA1,
-                            MbedTLS.digest(MD_SHA1, takebuf_array(sigbuf)),
+                            MbedTLS.digest(MD_SHA1, take!(sigbuf)),
                             sigblob)
                         # Indicate authentication success
                         success_message && write(session, PacketBuffer(SSH_MSG_USERAUTH_SUCCESS))
@@ -549,7 +549,7 @@ module SSH
         sig_buf = IOBuffer()
         write_string(sig_buf, pubkeydata[1:7])
         write_string(sig_buf, sig[1:len])
-        takebuf_array(sig_buf)
+        take!(sig_buf)
     end
 
     function clientauth_pubkey(session, username, pubkey, privkey, servicename = "ssh-connection")
@@ -578,7 +578,7 @@ module SSH
         write_request(buf)
 
         # Step 2: Open private key and compute signature
-        write_string(packet, generate_signature(pubkeydata, privkey, takebuf_array(buf)))
+        write_string(packet, generate_signature(pubkeydata, privkey, take!(buf)))
 
         write(session, packet)
         packet = require_packet(session)
@@ -678,15 +678,15 @@ module SSH
     end
 
     # Encoded terminal modes
-    const NCCS = is_linux() ? 32 : 20
-    const tcflag_t = is_linux() ? Cuint : Culong
+    const NCCS = Sys.islinux() ? 32 : 20
+    const tcflag_t = Sys.islinux() ? Cuint : Culong
     const speed_t = tcflag_t
-    immutable termios
+    struct termios
         c_iflag::tcflag_t
         c_oflag::tcflag_t
         c_cflag::tcflag_t
         c_lflag::tcflag_t
-        @static if is_linux()
+        @static if Sys.islinux()
             c_line::UInt8
         end
         c_cc::NTuple{NCCS, UInt8}
@@ -694,7 +694,7 @@ module SSH
         c_ospeed::speed_t
     end
 
-    const maps_idx = is_linux() ? 1 : 2
+    const maps_idx = Sys.islinux() ? 1 : 2
 
     op_char_map = Dict(
     #  SSH => (linux, Apple/BSD)

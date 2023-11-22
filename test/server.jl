@@ -1,13 +1,14 @@
-reload("SSH")
-isdefined(:sock) && close(sock)
-gc()
+using SSH, Sockets
+
+@isdefined(sock) && close(sock)
+GC.gc() # To run finalizers on socket
 port = length(ARGS) >= 1 ? parse(Int, ARGS[1]) : 10000
 sock = listen(port)
 
-function open_fake_pty()
-    const O_RDWR = Base.Filesystem.JL_O_RDWR
-    const O_NOCTTY = Base.Filesystem.JL_O_NOCTTY
+const O_RDWR = Base.Filesystem.JL_O_RDWR
+const O_NOCTTY = Base.Filesystem.JL_O_NOCTTY
 
+function open_fake_pty()
     fdm = ccall(:posix_openpt, Cint, (Cint,), O_RDWR|O_NOCTTY)
     fdm == -1 && error("Failed to open PTY master")
     rc = ccall(:grantpt, Cint, (Cint,), fdm)
@@ -26,7 +27,8 @@ end
 
 while true
     client = accept(sock)
-    @async begin
+    @info "Accepted connection"
+    @async try
         session = connect(SSH.Session, client; client = false)
         SSH.negotiate_algorithms!(session)
         SSH.server_dh_kex!(session,
@@ -72,10 +74,10 @@ while true
                     slave, master, masterfd = open_fake_pty()
                     new_termios = Ref{SSH.termios}()
                     systemerror("tcgetattr",
-                        -1 == ccall(:tcgetattr, Cint, (Cint, Ptr{Void}), slave, new_termios))
+                        -1 == ccall(:tcgetattr, Cint, (Cint, Ptr{Cvoid}), slave, new_termios))
                     new_termios[] = SSH.decode_modes(encoded_termios, new_termios[])
                     systemerror("tcsetattr",
-                        -1 == ccall(:tcsetattr, Cint, (Cint, Cint, Ptr{Void}), slave, 0, new_termios))
+                        -1 == ccall(:tcsetattr, Cint, (Cint, Cint, Ptr{Cvoid}), slave, 0, new_termios))
                     p = spawn(detach(`$(Base.julia_cmd()) -e $cmd`), slave, slave, slave)
                     @async while true
                         write(channel, readavailable(master))
@@ -90,6 +92,7 @@ while true
                 end
             end
         end
+    catch err
+        Base.showerror(stderr, err, catch_backtrace())
     end
-    println("Done")
 end
